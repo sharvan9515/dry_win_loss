@@ -1,0 +1,14 @@
+$ pip install pandas scikit-learn xgboost imbalanced-learn openpyxl
+WARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, status=None)) after connection broken by 'ProxyError('Cannot connect to proxy.', OSError('Tunnel connection failed: 403 Forbidden'))': /simple/pandas/
+WARNING: Retrying (Retry(total=3, connect=None, read=None, redirect=None, status=None)) after connection broken by 'ProxyError('Cannot connect to proxy.', OSError('Tunnel connection failed: 403 Forbidden'))': /simple/pandas/
+WARNING: Retrying (Retry(total=2, connect=None, read=None, redirect=None, status=None)) after connection broken by 'ProxyError('Cannot connect to proxy.', OSError('Tunnel connection failed: 403 Forbidden'))': /simple/pandas/
+WARNING: Retrying (Retry(total=1, connect=None, read=None, redirect=None, status=None)) after connection broken by 'ProxyError('Cannot connect to proxy.', OSError('Tunnel connection failed: 403 Forbidden'))': /simple/pandas/
+WARNING: Retrying (Retry(total=0, connect=None, read=None, redirect=None, status=None)) after connection broken by 'ProxyError('Cannot connect to proxy.', OSError('Tunnel connection failed: 403 Forbidden'))': /simple/pandas/
+ERROR: Could not find a version that satisfies the requirement pandas (from versions: none)
+ERROR: No matching distribution found for pandas
+
+$ python 09_no_discount_xgboost_full_optimized_v2.6.py
+Traceback (most recent call last):
+  File "/workspace/dry_win_loss/09_no_discount_xgboost_full_optimized_v2.6.py", line 30, in <module>
+    import pandas as pd
+ModuleNotFoundError: No module named 'pandas'

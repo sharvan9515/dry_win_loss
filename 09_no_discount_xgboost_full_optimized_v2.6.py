@@ -36,7 +36,6 @@ import re
 warnings.filterwarnings('ignore')
 
 import xgboost as xgb
-from sklearn.preprocessing import LabelEncoder
 from sklearn.calibration import CalibratedClassifierCV
 from imblearn.over_sampling import SMOTE
 from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score,
@@ -105,6 +104,28 @@ def load_tank_d365_data_filtered():
     print(f"\nTemporal Split: {len(train_df)} train, {len(test_df)} test")
 
     return train_df, test_df
+
+
+# =================================================================
+# VALIDATION SPLIT
+# =================================================================
+
+def split_training_validation(train_df, val_fraction=0.2):
+    """Temporal split of training data into train/validation"""
+    if not 0 < val_fraction < 1:
+        raise ValueError("val_fraction must be between 0 and 1")
+
+    split_idx = int(len(train_df) * (1 - val_fraction))
+    train_subset = train_df.iloc[:split_idx].copy()
+    val_subset = train_df.iloc[split_idx:].copy()
+
+    print("\n" + "="*80)
+    print("TRAIN/VALIDATION TEMPORAL SPLIT")
+    print("="*80)
+    print(f"\nTraining subset:   {len(train_subset)} quotes")
+    print(f"Validation subset: {len(val_subset)} quotes")
+
+    return train_subset, val_subset
 
 
 # =================================================================
@@ -314,8 +335,8 @@ def get_all_features():
     return original_features + interaction_features
 
 
-def prepare_features(train_df, test_df, feature_list):
-    """Prepare features with encoding"""
+def prepare_features(train_df, val_df, test_df, feature_list):
+    """Prepare features with encoding and no test leakage"""
     print("\n" + "="*80)
     print("FEATURE PREPARATION")
     print("="*80)
@@ -327,8 +348,10 @@ def prepare_features(train_df, test_df, feature_list):
     print(f"  - Interaction: {len(available_features) - 57}")
 
     X_train = train_df[available_features].copy()
+    X_val = val_df[available_features].copy()
     X_test = test_df[available_features].copy()
     y_train = train_df['Target'].values
+    y_val = val_df['Target'].values
     y_test = test_df['Target'].values
 
     # Categorical features
@@ -350,21 +373,33 @@ def prepare_features(train_df, test_df, feature_list):
     # Encode categorical
     label_encoders = {}
     for feat in categorical_features:
-        le = LabelEncoder()
-        combined = pd.concat([X_train[feat], X_test[feat]]).fillna('MISSING').astype(str)
-        le.fit(combined.unique())
+        train_values = X_train[feat].fillna('MISSING').astype(str)
+        classes = np.sort(train_values.unique())
+        mapping = {cls: idx for idx, cls in enumerate(classes)}
+        unknown_value = len(mapping)
 
-        X_train[feat] = le.transform(X_train[feat].fillna('MISSING').astype(str).apply(lambda x: x if x in le.classes_ else 'MISSING'))
-        X_test[feat] = le.transform(X_test[feat].fillna('MISSING').astype(str).apply(lambda x: x if x in le.classes_ else 'MISSING'))
-        label_encoders[feat] = le
+        def _map_values(series):
+            series = series.fillna('MISSING').astype(str)
+            return series.map(mapping).fillna(unknown_value).astype(int)
+
+        X_train[feat] = _map_values(X_train[feat])
+        X_val[feat] = _map_values(X_val[feat])
+        X_test[feat] = _map_values(X_test[feat])
+
+        label_encoders[feat] = {
+            'type': 'mapping',
+            'mapping': mapping,
+            'unknown_value': unknown_value,
+        }
 
     # Fill numeric missing
     X_train = X_train.fillna(0)
+    X_val = X_val.fillna(0)
     X_test = X_test.fillna(0)
 
-    print(f"\nSamples: {len(X_train)} train, {len(X_test)} test")
+    print(f"\nSamples: {len(X_train)} train, {len(X_val)} validation, {len(X_test)} test")
 
-    return X_train, X_test, y_train, y_test, available_features, label_encoders
+    return X_train, X_val, X_test, y_train, y_val, y_test, available_features, label_encoders
 
 
 # =================================================================
@@ -400,7 +435,7 @@ def apply_smote(X_train, y_train):
 # MODEL TRAINING
 # =================================================================
 
-def train_xgboost_optimized(X_train, y_train, X_test, y_test):
+def train_xgboost_optimized(X_train, y_train):
     """Train with optimized hyperparameters"""
     print("\n" + "="*80)
     print("XGBOOST TRAINING")
@@ -426,10 +461,7 @@ def train_xgboost_optimized(X_train, y_train, X_test, y_test):
     model.fit(X_train, y_train, verbose=False)
     print("[OK] Training complete")
 
-    # Predictions
-    y_test_proba = model.predict_proba(X_test)[:, 1]
-
-    return model, y_test_proba
+    return model
 
 
 # =================================================================
@@ -463,15 +495,15 @@ def optimize_threshold(y_test, y_test_proba):
 # CALIBRATION
 # =================================================================
 
-def calibrate_model(model, X_train, y_train):
-    """Apply isotonic calibration for confidence scores"""
+def calibrate_model(model, X_calibration, y_calibration):
+    """Apply isotonic calibration for confidence scores on held-out data"""
     print("\n" + "="*80)
     print("CALIBRATION - ISOTONIC FOR CONFIDENCE SCORES")
     print("="*80)
 
     print("\nApplying isotonic calibration...")
     calibrated = CalibratedClassifierCV(model, method='isotonic', cv='prefit')
-    calibrated.fit(X_train, y_train)
+    calibrated.fit(X_calibration, y_calibration)
     print("[OK] Calibration complete - probabilities now suitable for customer-facing confidence scores")
 
     return calibrated
@@ -498,30 +530,41 @@ def main():
     # 3. Interaction features (NEW!)
     train_df, test_df = create_interaction_features(train_df, test_df)
 
-    # 4. Prepare features
-    feature_list = get_all_features()
-    X_train, X_test, y_train, y_test, features, encoders = prepare_features(
-        train_df, test_df, feature_list
-    )
+    # 4. Split training into train/validation
+    train_df_model, val_df = split_training_validation(train_df, val_fraction=0.2)
 
-    # 5. Apply SMOTE
+    # 5. Prepare features
+    feature_list = get_all_features()
+    (
+        X_train,
+        X_val,
+        X_test,
+        y_train,
+        y_val,
+        y_test,
+        features,
+        encoders,
+    ) = prepare_features(train_df_model, val_df, test_df, feature_list)
+
+    # 6. Apply SMOTE (training only)
     X_train_balanced, y_train_balanced = apply_smote(X_train, y_train)
 
-    # 6. Train model
-    model, y_test_proba = train_xgboost_optimized(
-        X_train_balanced, y_train_balanced, X_test, y_test
+    # 7. Train model
+    model = train_xgboost_optimized(
+        X_train_balanced, y_train_balanced
     )
 
-    # 7. Calibrate
-    calibrated_model = calibrate_model(model, X_train_balanced, y_train_balanced)
+    # 8. Calibrate on validation set
+    calibrated_model = calibrate_model(model, X_val, y_val)
 
-    # 8. Get calibrated probabilities
+    # 9. Get calibrated probabilities
+    y_val_proba_calibrated = calibrated_model.predict_proba(X_val)[:, 1]
     y_test_proba_calibrated = calibrated_model.predict_proba(X_test)[:, 1]
 
-    # 9. Optimize threshold
-    optimal_threshold = optimize_threshold(y_test, y_test_proba_calibrated)
+    # 10. Optimize threshold using validation set
+    optimal_threshold = optimize_threshold(y_val, y_val_proba_calibrated)
 
-    # 10. Calculate confidence scores
+    # 11. Calculate confidence scores
     print("\n" + "="*80)
     print("CONFIDENCE SCORES CALCULATION")
     print("="*80)
@@ -537,10 +580,10 @@ def main():
     print("  - Loss confidence: Probability of losing (0-100%)")
     print("  - Sum of both = 100% for each quote")
 
-    # 11. Final predictions
+    # 12. Final predictions
     y_test_pred = (y_test_proba_calibrated >= optimal_threshold).astype(int)
 
-    # 12. Calculate metrics
+    # 13. Calculate metrics
     test_metrics = {
         'precision': precision_score(y_test, y_test_pred, zero_division=0),
         'recall': recall_score(y_test, y_test_pred, zero_division=0),
@@ -548,6 +591,42 @@ def main():
         'roc_auc': roc_auc_score(y_test, y_test_proba_calibrated),
         'accuracy': accuracy_score(y_test, y_test_pred)
     }
+
+    val_predictions = (y_val_proba_calibrated >= optimal_threshold).astype(int)
+    val_metrics = {
+        'precision': precision_score(y_val, val_predictions, zero_division=0),
+        'recall': recall_score(y_val, val_predictions, zero_division=0),
+        'f1': f1_score(y_val, val_predictions, zero_division=0),
+    }
+
+    print("\n" + "="*80)
+    print("MODEL METRICS OVERVIEW")
+    print("="*80)
+
+    metric_labels = {
+        'precision': 'Precision',
+        'recall': 'Recall',
+        'f1': 'F1 Score',
+        'roc_auc': 'ROC-AUC',
+        'accuracy': 'Accuracy',
+    }
+
+    print("\nTest Metrics (calibrated threshold):")
+    for key in ['precision', 'recall', 'f1', 'accuracy', 'roc_auc']:
+        if key in test_metrics:
+            value = test_metrics[key]
+            label = metric_labels.get(key, key)
+            if key in {'roc_auc', 'f1'}:
+                print(f"  {label:<10}: {value:.4f}")
+            else:
+                print(f"  {label:<10}: {value:.4f} ({value * 100:.1f}%)")
+
+    print("\nValidation Metrics (calibrated threshold):")
+    for key in ['precision', 'recall', 'f1']:
+        if key in val_metrics:
+            value = val_metrics[key]
+            label = metric_labels.get(key, key)
+            print(f"  {label:<10}: {value:.4f} ({value * 100:.1f}%)")
 
     # 13. Confidence score statistics
     print("\n" + "="*80)
@@ -598,6 +677,11 @@ def main():
     print(f"  ROC-AUC:   {test_metrics['roc_auc']:.4f}")
     print(f"  Threshold: {optimal_threshold:.4f}")
 
+    print("\nValidation Metrics (for threshold tuning):")
+    print(f"  Precision: {val_metrics['precision']:.4f}")
+    print(f"  Recall:    {val_metrics['recall']:.4f}")
+    print(f"  F1 Score:  {val_metrics['f1']:.4f}")
+
     if test_metrics['f1'] >= 0.60:
         print(f"\n  SUCCESS: F1 = {test_metrics['f1']:.4f} >= 0.60 target!")
     else:
@@ -639,6 +723,7 @@ def main():
         'features': features,
         'encoders': encoders,
         'test_metrics': test_metrics,
+        'validation_metrics': val_metrics,
         'optimal_threshold': optimal_threshold,
         'feature_importance': importance_df.to_dict('records'),
         'training_date': datetime.now(),
@@ -674,7 +759,7 @@ def main():
 
     print(f"\n[OK] Model saved: {MODEL_PATH}")
     print("\nModel includes:")
-    print("  - Calibrated probabilities (Platt scaling)")
+    print("  - Calibrated probabilities (isotonic)")
     print("  - Confidence score calculation method")
     print("  - Win/Loss confidence interpretation")
 
@@ -693,7 +778,7 @@ def main():
     print(f"  Improvement: {(test_metrics['f1'] - 0.584):.4f} ({(test_metrics['f1']/0.584 - 1)*100:+.1f}%)")
 
     print("\n  CONFIDENCE SCORES:")
-    print(f"    - Calibration: Platt scaling (sigmoid)")
+    print(f"    - Calibration: Isotonic regression")
     print(f"    - Range: 0-100% for both win and loss")
     print(f"    - Customer-facing: Ready for sales team display")
 
